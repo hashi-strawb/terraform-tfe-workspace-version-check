@@ -1,4 +1,16 @@
 terraform {
+  // When testing new versions of this... uncomment the below
+
+  /*
+  cloud {
+    organization = "lmhd"
+
+    workspaces {
+      name = "terraform-version-check"
+    }
+  }
+*/
+
   required_providers {
     tfe = {
       source = "hashicorp/tfe"
@@ -24,10 +36,6 @@ data "tfe_organizations" "orgs" {
     }
   }
 }
-output "orgs" {
-  value = data.tfe_organizations.orgs.names
-
-}
 
 locals {
   org_name = data.tfe_organizations.orgs.names[0]
@@ -51,6 +59,13 @@ data "http" "checkpoint-terraform" {
 
 locals {
   latest_version = jsondecode(data.http.checkpoint-terraform.response_body).current_version
+
+  # Use SemVer terminology, i.e. Major.Minor.Patch
+  # (Marketting Terminology usually calls these ???.Major.Minor)
+  latest_patch_version = local.latest_version
+
+  latest_version_split = split(".", local.latest_version)
+  latest_minor_version = join(".", [local.latest_version_split[0], local.latest_version_split[1]])
 }
 
 
@@ -80,22 +95,52 @@ data "tfe_workspace" "workspace" {
 
 
 locals {
-  workspaces_and_versions = {
-    for k, v in data.tfe_workspace.workspace :
-    k => v.terraform_version
+
+  # Patch Versions
+
+  workspaces_and_patch_versions = {
+    for k, workspace in data.tfe_workspace.workspace :
+    k => workspace.terraform_version
   }
 
-  # TODO: The current limitation here is that if a workspace is not using EXACTLY
-  # the latest version then we flag it as non-compliant. In reality... I probably
-  # only care that it's using the latest major version (e.g. v1.4.x)
-  # (Minor version, in SemVer speak. Major in marketting speak)
-  workspaces_with_old_versions = {
-    for k, v in data.tfe_workspace.workspace :
-    k => v.terraform_version if
-    v.terraform_version != local.latest_version
+  workspaces_with_old_patch_versions = {
+    for k, workspace_version in local.workspaces_and_patch_versions :
+    k => workspace_version if
+    workspace_version != local.latest_patch_version &&
+    workspace_version != "latest"
   }
 
-  num_workspaces_with_old_versions = length(keys(local.workspaces_with_old_versions))
+  num_workspaces_with_old_patch_versions = length(keys(local.workspaces_with_old_patch_versions))
+
+
+  # Minor Versions
+
+  workspaces_and_minor_versions = {
+    for k, workspace in data.tfe_workspace.workspace :
+    k => try(
+      join(".",
+        [
+          split(".", workspace.terraform_version)[0],
+          split(".", workspace.terraform_version)[1],
+        ]
+      ),
+      workspace.terraform_version
+    )
+  }
+
+  workspaces_with_old_minor_versions = {
+    for k, workspace_version in local.workspaces_and_minor_versions :
+    k => workspace_version if
+    workspace_version != local.latest_minor_version &&
+    workspace_version != "latest"
+  }
+
+  num_workspaces_with_old_minor_versions = length(keys(local.workspaces_with_old_minor_versions))
+
+
+  # And whichever we're actually interested in
+  workspaces_with_old_versions     = var.check_patch_versions ? local.workspaces_with_old_patch_versions : local.workspaces_with_old_minor_versions
+  num_workspaces_with_old_versions = var.check_patch_versions ? local.num_workspaces_with_old_patch_versions : local.num_workspaces_with_old_minor_versions
 }
 
 
@@ -106,13 +151,10 @@ locals {
 
 resource "terraform_data" "assert" {
   lifecycle {
-    precondition {
-      condition     = local.num_workspaces_with_old_versions == 0
+    postcondition {
+      condition     = (local.num_workspaces_with_old_versions) == 0
       error_message = "Detected workspaces with old Terraform:\n${jsonencode(local.workspaces_with_old_versions)}"
     }
   }
 }
-
-
-
 
